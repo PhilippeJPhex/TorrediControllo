@@ -214,28 +214,75 @@ export default function App() {
   const activitiesDone = () =>
     Object.entries(data.activities).flatMap(([cat, acts]) => acts.slice(0, 5).map((a) => `[${cat}] ${a.title}`)).join("\n") || "nessuna attività registrata";
 
+  const [ispoProgress, setIspoProgress] = useState("");
+  const [noteEditing, setNoteEditing] = useState(null); // { scanId, idx }
+  const [noteText, setNoteText] = useState("");
+
+  const saveObsNote = (scanId, idx) => {
+    persist({
+      ...data,
+      ispoScans: data.ispoScans.map((sc) =>
+        sc.id === scanId
+          ? { ...sc, observations: sc.observations.map((o, i) => (i === idx ? { ...o, userNote: noteText.trim() || null, userNoteAt: noteText.trim() ? new Date().toISOString() : null } : o)) }
+          : sc
+      ),
+    });
+    setNoteEditing(null);
+    setNoteText("");
+  };
+
   const generateIspo = async () => {
     setIspoError("");
     if (!data.competitors.length) { setIspoError("Aggiungi almeno un competitor da analizzare."); return; }
     setIspoLoading(true);
     try {
-      const list = data.competitors.join(", ");
-      const research = await callClaude(
-        `Cerca sul web le attività di comunicazione RECENTI di questi brand orologieri: ${list}. Per ciascun brand cerca: campagne social, uscite stampa, collaborazioni, lanci di prodotto, iniziative di marketing. Per OGNI attività trovata riporta anche: QUANDO è stata lanciata (data o periodo, il più preciso possibile dalle fonti), se è ancora in corso, e se ha una durata definita o stimabile (es. edizione limitata, campagna stagionale, collaborazione one-shot, serie continuativa). Riassumi in italiano, brand per brand, con il maggior dettaglio possibile su ogni attività. Se per un brand non trovi nulla di recente, dillo esplicitamente.`,
-        true, 3000
-      );
-      if (!research || research.trim().length < 50) throw new Error("ricerca vuota");
+      const allObservations = [];
+      const researchSummaries = [];
 
+      /* FASE 1 — una ricerca web DEDICATA per ogni brand (5 ricerche ciascuno) */
+      for (let bi = 0; bi < data.competitors.length; bi++) {
+        const brand = data.competitors[bi];
+        setIspoProgress(`Analisi ${bi + 1}/${data.competitors.length}: ${brand}…`);
+        let research = "";
+        try {
+          research = await callClaude(
+            `Sei un analista di competitive intelligence per il settore orologiero. Cerca sul web le attività di comunicazione e marketing RECENTI (ultimi 6-12 mesi) del brand orologiero "${brand}". Fai più ricerche mirate: collaborazioni e edizioni speciali, uscite stampa e recensioni, campagne social e community, eventi e fiere, lanci di prodotto.\n\nPer OGNI singola attività trovata, riporta con la massima specificità possibile:\n- COSA esattamente (meccanica: che tipo di collab/campagna/lancio, quanti pezzi, che prezzo se noto)\n- CHI è coinvolto (nome del partner, della testata, del designer, dell'evento)\n- QUANDO (data o mese preciso dalle fonti) e durata/stato\n- DOVE (canali: IG, YouTube, stampa specifica; mercati geografici)\n- Segnali di risultato se presenti (sold out, tempi di esaurimento, copertura ottenuta, numeri citati)\n\nNON generalizzare in strategie ("puntano sulle collaborazioni") — voglio i fatti specifici, uno per uno, con nomi e date. Se una informazione non c'è nelle fonti, dillo. Rispondi in italiano.`,
+            true, 3000
+          );
+        } catch (e) {
+          researchSummaries.push(`${brand}: ricerca fallita (${e.message})`);
+          continue;
+        }
+        researchSummaries.push(`=== ${brand} ===\n${research}`);
+
+        /* FASE 2 (per brand) — strutturazione con schema di intelligence completo */
+        try {
+          const txt = await callClaude(
+            `${BRAND_CONTEXT}\n\nRisultati di ricerca sulle attività recenti di "${brand}":\n${research}\n\nStruttura OGNI attività specifica trovata come scheda di competitive intelligence. Una scheda per attività (non riassunti di strategia). Rispondi SOLO con JSON puro, senza backtick:\n{"observations":[{"who":"${brand}","what":"<titolo attività specifico, max 12 parole>","type":"<collaborazione|lancio prodotto|PR/stampa|evento|campagna social|altro>","partners":"<nomi di partner/testate/persone coinvolte, o 'non indicato'>","when":"<data o periodo dalle fonti, o 'non determinabile'>","duration":"<'in corso'|'one-shot'|'edizione limitata N pezzi'|durata|'non determinabile'>","where":"<canali e mercati, es. 'IG + stampa USA'>","mechanics":"<come funziona esattamente l'iniziativa, max 40 parole>","why":"<obiettivo strategico che rivela, max 20 parole>","impact":"<segnali di risultato dalle fonti: sold out, copertura, numeri; o 'non misurabile dalle fonti'>","implications":"<cosa dice sulle intenzioni del brand e sul mercato, max 25 parole>","takeaway":"<lezione operativa per Calamai: replicare/tradurre/evitare/spazio scoperto, max 25 parole>"}]}\nRegola ferrea: se un dato non emerge dalle fonti scrivi 'non determinabile' o 'non indicato' — MAI inventare nomi, date o numeri.`,
+            false, 3000
+          );
+          const j = extractJSON(txt);
+          allObservations.push(...(j.observations || []));
+        } catch (e) { /* brand senza risultati strutturabili: si prosegue */ }
+      }
+
+      if (!allObservations.length) throw new Error("nessuna attività strutturabile trovata");
+
+      /* FASE 3 — idee dal quadro completo */
+      setIspoProgress("Generazione idee…");
       const prevIdeas = data.ideas.slice(0, 20).map((i) => `- ${i.title}`).join("\n") || "nessuna";
-      const txt = await callClaude(
-        `${BRAND_CONTEXT}\n\nAttività di comunicazione già svolte da Calamai:\n${activitiesDone()}\n\nIdee già proposte in passato (NON riproporle):\n${prevIdeas}\n\nRisultati di una ricerca di mercato sui competitor selezionati (${list}):\n${research}\n\nProduci: (1) osservazioni dettagliate per OGNI attività trovata di ogni competitor — una scheda per attività, non una per brand — con timeline e durata; (2) 4-6 NUOVE idee di comunicazione per Calamai ispirate a ciò che funziona, adattate al suo posizionamento (acciaio da turbine militari, artigianato toscano, conto visione), ciascuna con un principio di piano di attuazione in 3-5 passi concreti. Rispondi SOLO con JSON puro, senza backtick né testo extra:\n{"observations":[{"who":"<brand>","what":"<titolo attività, max 12 parole>","detail":"<descrizione dettagliata, meccanica e obiettivo, max 50 parole>","when":"<quando lanciata, es. 'marzo 2026' o 'non determinabile'>","duration":"<'in corso'|'edizione limitata'|'one-shot'|durata|'non determinabile'>"}],"ideas":[{"title":"<idea, max 10 parole>","detail":"<come applicarla a Calamai, max 40 parole>","effort":"<basso|medio|alto>","plan":["<passo 1>","<passo 2>","<passo 3>"]}]}\nSe una data o durata non emerge dalle fonti, scrivi "non determinabile" — non inventare.`,
-        false, 3000
+      const obsSummary = allObservations.map((o) => `- [${o.who}] ${o.what} (${o.when}) → takeaway: ${o.takeaway}`).join("\n");
+      const prevNotes = data.ispoScans.flatMap((sc) => sc.observations.filter((o) => o.userNote).map((o) => `- [${o.who}] ${o.what}: ${o.userNote}`)).slice(0, 15).join("\n");
+      const ideasTxt = await callClaude(
+        `${BRAND_CONTEXT}\n\nAttività già svolte da Calamai:\n${activitiesDone()}\n\nIdee già proposte (NON riproporle):\n${prevIdeas}\n\nIntelligence raccolta sui competitor:\n${obsSummary}\n${prevNotes ? `\nNote manuali del PR manager su osservazioni precedenti (pesale molto — sono verifiche di prima mano):\n${prevNotes}\n` : ""}\nGenera 4-6 NUOVE idee di comunicazione per Calamai che sfruttino ciò che l'intelligence rivela (pattern che funzionano da tradurre nel territorio Calamai, spazi lasciati scoperti dai competitor), ciascuna con piano di attuazione in 3-5 passi concreti. Rispondi SOLO con JSON puro:\n{"ideas":[{"title":"<idea, max 10 parole>","detail":"<come applicarla a Calamai e da quale evidenza nasce, max 45 parole>","effort":"<basso|medio|alto>","plan":["<passo 1>","<passo 2>","<passo 3>"]}]}`,
+        false, 2000
       );
-      const j = extractJSON(txt);
-      const scan = { id: uid(), generatedAt: new Date().toISOString(), analyzed: [...data.competitors], observations: j.observations || [] };
-      const newIdeas = (j.ideas || []).map((i) => ({ id: uid(), createdAt: scan.generatedAt, source: "scan", brief: null, ...i }));
+      const ji = extractJSON(ideasTxt);
+      const scan = { id: uid(), generatedAt: new Date().toISOString(), analyzed: [...data.competitors], observations: allObservations };
+      const newIdeas = (ji.ideas || []).map((i) => ({ id: uid(), createdAt: scan.generatedAt, source: "scan", brief: null, ...i }));
       persist({ ...data, ispoScans: [scan, ...data.ispoScans].slice(0, 30), ideas: [...newIdeas, ...data.ideas] });
     } catch (e) { setIspoError(`Ricerca non riuscita (${e.message}). Riprova tra qualche istante.`); }
+    setIspoProgress("");
     setIspoLoading(false);
   };
 
@@ -244,7 +291,7 @@ export default function App() {
     setMoreIdeasError(""); setMoreIdeasLoading(true);
     try {
       const existing = data.ideas.slice(0, 25).map((i) => `- ${i.title}`).join("\n") || "nessuna";
-      const marketNotes = (data.ispoScans[0]?.observations || []).map((o) => `- ${o.who}: ${o.what}${o.when ? ` (${o.when})` : ""}`).join("\n") || "nessuna scansione recente";
+      const marketNotes = (data.ispoScans[0]?.observations || []).map((o) => `- ${o.who}: ${o.what}${o.when ? ` (${o.when})` : ""}${o.takeaway ? ` → ${o.takeaway}` : ""}${o.userNote ? ` | nota del PR manager: ${o.userNote}` : ""}`).join("\n") || "nessuna scansione recente";
       const txt = await callClaude(
         `${BRAND_CONTEXT}\n\nAttività già svolte da Calamai:\n${activitiesDone()}\n\nIdee già proposte in precedenza (NON ripeterle):\n${existing}\n\nOsservazioni recenti sul mercato:\n${marketNotes}\n\nBrief del PR manager per questa generazione: "${ideaBrief.trim() || "idee libere, purché coerenti col brand"}"\n\nGenera 3-5 NUOVE idee di comunicazione per Calamai che rispondano al brief, ciascuna con un principio di piano di attuazione in 3-5 passi concreti. Rispondi SOLO con JSON puro, senza backtick né testo extra:\n{"ideas":[{"title":"<idea, max 10 parole>","detail":"<come applicarla a Calamai, max 40 parole>","effort":"<basso|medio|alto>","plan":["<passo 1>","<passo 2>","<passo 3>"]}]}`,
         false, 2000
@@ -599,7 +646,7 @@ export default function App() {
                 <h2 style={S.h2}>Ispo</h2>
                 <p style={S.sub}>Ricerca web live sui competitor che scegli tu. Ogni scansione resta in archivio; le idee si accumulano.</p>
               </div>
-              <button style={{ ...S.btn, ...S.btnRed }} onClick={generateIspo} disabled={ispoLoading}>{ispoLoading ? "Ricerca web in corso…" : "Scansiona competitor"}</button>
+              <button style={{ ...S.btn, ...S.btnRed }} onClick={generateIspo} disabled={ispoLoading}>{ispoLoading ? (ispoProgress || "Ricerca web in corso…") : "Scansiona competitor"}</button>
             </div>
 
             <div style={{ ...S.card, padding: 14, marginTop: 14 }}>
@@ -628,16 +675,61 @@ export default function App() {
                   Ultima scansione: {fmtDT(data.ispoScans[0].generatedAt)} <span style={{ color: T.green }}>· ricerca web live</span> · brand: {data.ispoScans[0].analyzed.join(", ")}
                 </div>
                 <div style={{ ...S.mono, fontSize: 11, fontWeight: 700, marginBottom: 8 }}>Osservato sul mercato</div>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 10 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(340px, 1fr))", gap: 10 }}>
                   {data.ispoScans[0].observations.map((o, i) => (
-                    <div key={i} style={{ ...S.card, padding: 12 }}>
-                      <span style={{ ...S.mono, fontSize: 10, color: T.red }}>{o.who}</span>
-                      <div style={{ fontSize: 13, fontWeight: 600, marginTop: 4 }}>{o.what}</div>
-                      {o.detail && <div style={{ fontSize: 12, color: T.inkSoft, marginTop: 4 }}>{o.detail}</div>}
-                      <div style={{ display: "flex", gap: 12, marginTop: 8, flexWrap: "wrap" }}>
-                        {o.when && <span style={{ ...S.mono, fontSize: 9, color: T.grey }}>⏱ lancio: <span style={{ color: T.ink }}>{o.when}</span></span>}
-                        {o.duration && <span style={{ ...S.mono, fontSize: 9, color: T.grey }}>durata: <span style={{ color: T.ink }}>{o.duration}</span></span>}
+                    <div key={i} style={{ ...S.card, padding: 14 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                        <span style={{ ...S.mono, fontSize: 10, color: T.red }}>{o.who}</span>
+                        {o.type && <span style={{ ...S.mono, fontSize: 8, color: T.grey, border: `1px solid ${T.line}`, borderRadius: 10, padding: "2px 8px" }}>{o.type}</span>}
                       </div>
+                      <div style={{ fontSize: 13, fontWeight: 600, marginTop: 4 }}>{o.what}</div>
+                      {(o.mechanics || o.detail) && <div style={{ fontSize: 12, color: T.inkSoft, marginTop: 4 }}>{o.mechanics || o.detail}</div>}
+                      <div style={{ display: "grid", gap: 3, marginTop: 8, fontSize: 11 }}>
+                        {o.partners && o.partners !== "non indicato" && <div><b style={{ ...S.mono, fontSize: 8, color: T.grey }}>CHI</b> {o.partners}</div>}
+                        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                          {o.when && <span><b style={{ ...S.mono, fontSize: 8, color: T.grey }}>QUANDO</b> {o.when}</span>}
+                          {o.duration && <span><b style={{ ...S.mono, fontSize: 8, color: T.grey }}>DURATA</b> {o.duration}</span>}
+                        </div>
+                        {o.where && <div><b style={{ ...S.mono, fontSize: 8, color: T.grey }}>DOVE</b> {o.where}</div>}
+                        {o.why && <div><b style={{ ...S.mono, fontSize: 8, color: T.grey }}>PERCHÉ</b> {o.why}</div>}
+                        {o.impact && <div><b style={{ ...S.mono, fontSize: 8, color: T.grey }}>IMPATTO</b> {o.impact}</div>}
+                        {o.implications && <div><b style={{ ...S.mono, fontSize: 8, color: T.grey }}>IMPLICAZIONI</b> {o.implications}</div>}
+                      </div>
+                      {o.takeaway && (
+                        <div style={{ background: T.paper, borderRadius: 3, padding: "8px 10px", marginTop: 8, fontSize: 12 }}>
+                          <span style={{ ...S.mono, fontSize: 8, color: T.red }}>PER CALAMAI</span> {o.takeaway}
+                        </div>
+                      )}
+                      {noteEditing && noteEditing.scanId === data.ispoScans[0].id && noteEditing.idx === i ? (
+                        <div style={{ marginTop: 8 }}>
+                          <textarea
+                            style={{ ...S.input, minHeight: 60, resize: "vertical", fontFamily: "inherit" }}
+                            placeholder="Le tue note: dettagli raccolti, fonti, valutazioni…"
+                            value={noteText}
+                            onChange={(e) => setNoteText(e.target.value)}
+                            autoFocus
+                          />
+                          <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                            <button style={{ ...S.btn, ...S.btnRed, padding: "6px 12px" }} onClick={() => saveObsNote(data.ispoScans[0].id, i)}>Salva</button>
+                            <button style={{ ...S.btn, ...S.btnGhost, padding: "6px 12px" }} onClick={() => { setNoteEditing(null); setNoteText(""); }}>Annulla</button>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          {o.userNote && (
+                            <div style={{ borderLeft: `3px solid ${T.amber}`, background: "#fdfaf2", borderRadius: 3, padding: "8px 10px", marginTop: 8, fontSize: 12, whiteSpace: "pre-wrap" }}>
+                              <span style={{ ...S.mono, fontSize: 8, color: T.amber }}>NOTA MIA{o.userNoteAt ? ` · ${fmtDT(o.userNoteAt)}` : ""}</span>
+                              <div style={{ marginTop: 2 }}>{o.userNote}</div>
+                            </div>
+                          )}
+                          <button
+                            style={{ ...S.btn, ...S.btnGhost, padding: "5px 10px", fontSize: 9, marginTop: 8 }}
+                            onClick={() => { setNoteEditing({ scanId: data.ispoScans[0].id, idx: i }); setNoteText(o.userNote || ""); }}
+                          >
+                            {o.userNote ? "Modifica nota" : "+ Aggiungi nota"}
+                          </button>
+                        </>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -651,8 +743,27 @@ export default function App() {
                   <div key={sc.id} style={{ ...S.card, padding: 14, marginTop: 10 }}>
                     <div style={{ ...S.mono, fontSize: 10, color: T.grey, marginBottom: 6 }}>{fmtDT(sc.generatedAt)} · {sc.analyzed.join(", ")}</div>
                     {sc.observations.map((o, i) => (
-                      <div key={i} style={{ fontSize: 12, padding: "5px 0", borderTop: i ? `1px solid ${T.line}` : "none" }}>
-                        <span style={{ ...S.mono, fontSize: 8, color: T.red }}>{o.who}</span> — <b>{o.what}</b>{o.detail ? ` · ${o.detail}` : ""}{o.when ? ` · lancio: ${o.when}` : ""}{o.duration ? ` · ${o.duration}` : ""}
+                      <div key={i} style={{ fontSize: 12, padding: "6px 0", borderTop: i ? `1px solid ${T.line}` : "none" }}>
+                        <span style={{ ...S.mono, fontSize: 8, color: T.red }}>{o.who}</span> — <b>{o.what}</b>
+                        {(o.mechanics || o.detail) ? ` · ${o.mechanics || o.detail}` : ""}{o.when ? ` · ${o.when}` : ""}{o.duration ? ` · ${o.duration}` : ""}
+                        {o.userNote && (
+                          <div style={{ borderLeft: `2px solid ${T.amber}`, paddingLeft: 8, marginTop: 4, color: T.inkSoft, whiteSpace: "pre-wrap" }}>
+                            <span style={{ ...S.mono, fontSize: 8, color: T.amber }}>NOTA MIA</span> {o.userNote}
+                          </div>
+                        )}
+                        {noteEditing && noteEditing.scanId === sc.id && noteEditing.idx === i ? (
+                          <div style={{ marginTop: 6 }}>
+                            <textarea style={{ ...S.input, minHeight: 50, resize: "vertical", fontFamily: "inherit" }} value={noteText} onChange={(e) => setNoteText(e.target.value)} autoFocus />
+                            <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
+                              <button style={{ ...S.btn, ...S.btnRed, padding: "5px 10px", fontSize: 9 }} onClick={() => saveObsNote(sc.id, i)}>Salva</button>
+                              <button style={{ ...S.btn, ...S.btnGhost, padding: "5px 10px", fontSize: 9 }} onClick={() => { setNoteEditing(null); setNoteText(""); }}>Annulla</button>
+                            </div>
+                          </div>
+                        ) : (
+                          <button style={{ background: "none", border: "none", cursor: "pointer", color: T.grey, fontSize: 10, padding: 0, marginTop: 3, textDecoration: "underline" }} onClick={() => { setNoteEditing({ scanId: sc.id, idx: i }); setNoteText(o.userNote || ""); }}>
+                            {o.userNote ? "modifica nota" : "+ nota"}
+                          </button>
+                        )}
                       </div>
                     ))}
                   </div>
