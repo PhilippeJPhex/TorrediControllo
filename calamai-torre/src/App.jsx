@@ -68,9 +68,40 @@ async function callClaude(prompt, useSearch = false, maxTokens = 1500) {
 
 function extractJSON(txt) {
   const clean = txt.replace(/```json|```/g, "");
-  const s = clean.indexOf("{"), e = clean.lastIndexOf("}");
-  if (s === -1 || e === -1) throw new Error("Risposta senza JSON");
-  return JSON.parse(clean.slice(s, e + 1));
+  const s = clean.indexOf("{");
+  if (s === -1) throw new Error("Risposta senza JSON");
+  let body = clean.slice(s, clean.lastIndexOf("}") + 1 || undefined);
+
+  const tryParse = (str) => { try { return JSON.parse(str); } catch { return null; } };
+
+  let parsed = tryParse(body);
+  if (parsed) return parsed;
+
+  /* Riparazione per risposte troncate: taglia all'ultimo oggetto completo
+     e chiude le parentesi rimaste aperte (ignorando quelle dentro le stringhe). */
+  const closersFor = (str) => {
+    const stack = [];
+    let inStr = false, esc = false;
+    for (const ch of str) {
+      if (esc) { esc = false; continue; }
+      if (ch === "\\") { esc = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === "{" || ch === "[") stack.push(ch);
+      else if (ch === "}" || ch === "]") stack.pop();
+    }
+    return stack.reverse().map((c) => (c === "{" ? "}" : "]")).join("");
+  };
+
+  let cut = body.length;
+  for (let attempt = 0; attempt < 30; attempt++) {
+    cut = body.lastIndexOf("}", cut - 1);
+    if (cut <= 0) break;
+    const candidate = body.slice(0, cut + 1);
+    parsed = tryParse(candidate + closersFor(candidate));
+    if (parsed) return parsed;
+  }
+  throw new Error("JSON non riparabile");
 }
 
 const EMPTY_DATA = { activities: {}, kpis: [], competitors: DEFAULT_COMPETITORS, ispoScans: [], ideas: [], plans: [], mentions: [], contacts: [], reports: [] };
@@ -258,8 +289,8 @@ export default function App() {
         /* FASE 2 (per brand) — strutturazione con schema di intelligence completo */
         try {
           const txt = await callClaude(
-            `${BRAND_CONTEXT}\n\nRisultati di ricerca sulle attività recenti di "${brand}":\n${research}\n\nStruttura OGNI attività specifica trovata come scheda di competitive intelligence. Una scheda per attività (non riassunti di strategia). Rispondi SOLO con JSON puro, senza backtick:\n{"observations":[{"who":"${brand}","what":"<titolo attività specifico, max 12 parole>","type":"<collaborazione|lancio prodotto|PR/stampa|evento|campagna social|altro>","partners":"<nomi di partner/testate/persone coinvolte, o 'non indicato'>","when":"<data o periodo dalle fonti, o 'non determinabile'>","duration":"<'in corso'|'one-shot'|'edizione limitata N pezzi'|durata|'non determinabile'>","where":"<canali e mercati, es. 'IG + stampa USA'>","mechanics":"<come funziona esattamente l'iniziativa, max 40 parole>","why":"<obiettivo strategico che rivela, max 20 parole>","impact":"<segnali di risultato dalle fonti: sold out, copertura, numeri; o 'non misurabile dalle fonti'>","implications":"<cosa dice sulle intenzioni del brand e sul mercato, max 25 parole>","takeaway":"<lezione operativa per Calamai: replicare/tradurre/evitare/spazio scoperto, max 25 parole>"}]}\nRegola ferrea: se un dato non emerge dalle fonti scrivi 'non determinabile' o 'non indicato' — MAI inventare nomi, date o numeri.`,
-            false, 3000
+            `${BRAND_CONTEXT}\n\nRisultati di ricerca sulle attività recenti di "${brand}":\n${research}\n\nStruttura le attività specifiche trovate come schede di competitive intelligence. Una scheda per attività (non riassunti di strategia). MASSIMO 6 schede: se le attività trovate sono di più, scegli le 6 più significative. Sii telegrafico in ogni campo. Rispondi SOLO con JSON puro, senza backtick:\n{"observations":[{"who":"${brand}","what":"<titolo attività specifico, max 12 parole>","type":"<collaborazione|lancio prodotto|PR/stampa|evento|campagna social|altro>","partners":"<nomi coinvolti, o 'non indicato'>","when":"<data o periodo, o 'non determinabile'>","duration":"<'in corso'|'one-shot'|'edizione limitata N pezzi'|durata|'non determinabile'>","where":"<canali e mercati>","mechanics":"<come funziona, max 30 parole>","why":"<obiettivo che rivela, max 15 parole>","impact":"<segnali di risultato dalle fonti, o 'non misurabile'>","implications":"<cosa dice sulle intenzioni, max 20 parole>","takeaway":"<lezione per Calamai, max 20 parole>"}]}\nRegola ferrea: se un dato non emerge dalle fonti scrivi 'non determinabile' o 'non indicato' — MAI inventare nomi, date o numeri.`,
+            false, 3800
           );
           const j = extractJSON(txt);
           allObservations.push(...(j.observations || []));
@@ -275,7 +306,7 @@ export default function App() {
       const prevNotes = data.ispoScans.flatMap((sc) => sc.observations.filter((o) => o.userNote).map((o) => `- [${o.who}] ${o.what}: ${o.userNote}`)).slice(0, 15).join("\n");
       const ideasTxt = await callClaude(
         `${BRAND_CONTEXT}\n\nAttività già svolte da Calamai:\n${activitiesDone()}\n\nIdee già proposte (NON riproporle):\n${prevIdeas}\n\nIntelligence raccolta sui competitor:\n${obsSummary}\n${prevNotes ? `\nNote manuali del PR manager su osservazioni precedenti (pesale molto — sono verifiche di prima mano):\n${prevNotes}\n` : ""}\nGenera 4-6 NUOVE idee di comunicazione per Calamai che sfruttino ciò che l'intelligence rivela (pattern che funzionano da tradurre nel territorio Calamai, spazi lasciati scoperti dai competitor), ciascuna con piano di attuazione in 3-5 passi concreti. Rispondi SOLO con JSON puro:\n{"ideas":[{"title":"<idea, max 10 parole>","detail":"<come applicarla a Calamai e da quale evidenza nasce, max 45 parole>","effort":"<basso|medio|alto>","plan":["<passo 1>","<passo 2>","<passo 3>"]}]}`,
-        false, 2000
+        false, 3000
       );
       const ji = extractJSON(ideasTxt);
       const scan = { id: uid(), generatedAt: new Date().toISOString(), analyzed: [...data.competitors], observations: allObservations };
